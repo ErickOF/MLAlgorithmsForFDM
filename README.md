@@ -90,7 +90,7 @@ Then open `http://localhost:5000` in your browser.
 
 ## Dataset Notes
 
-- Source: replication of Shirmohammadi (2021) experimental design
+- Source: experimental design after printing 43 samples.
 - Experiments 28, 38, and 40 are excluded from roughness targets (identified bias)
 - Small dataset — models selected for robustness with few samples
 
