@@ -683,7 +683,7 @@ app = Flask(__name__)
 
 _data_cache: tuple[pd.DataFrame, pd.DataFrame] | None = None
 _raw_df_cache: pd.DataFrame | None = None
-DATA_PATH = Path(__file__).parent / "../data/data.xlsx"
+DATA_PATH = Path(__file__).parent / "data/data.xlsx"
 SHEET_NAME = "Datos a utilizar en Minitab"
 
 # Export session store: session_id → cached data
@@ -1753,11 +1753,10 @@ function _modelPanel(tabId, taskType, hasSweep) {
       '<h3>Sweep de hiperpar\u00e1metros</h3>' +
       '<div id="sweep-content-' + tabId + '"></div></div>';
   }
-  html += '</div>';
+  html += '</div>';  // close panel-section (Métricas)
+  html += '</div>';  // close tab-panel
   return html;
-}
-
-const _lastObjForTab = {};  // tabId → last objective string
+}  // tabId → last objective string
 
 function _handleResult(data) {
   // algo_sweep_charts is emitted automatically (not a counted task)
