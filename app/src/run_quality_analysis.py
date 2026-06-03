@@ -182,33 +182,39 @@ def infer_targets(columns: list[str]) -> tuple[str | None, str | None]:
     return precision_col, roughness_col
 
 
-def read_sheet_clean(data_path: Path, sheet_name: str) -> pd.DataFrame:
+def read_sheet_clean(
+    data_path: Path,
+    sheet_name: str | int = 0,
+    header_row: int | None = None,
+    start_col: int | None = None,
+) -> pd.DataFrame:
     raw = pd.read_excel(data_path, sheet_name=sheet_name, header=None)
 
-    header_row = None
-    for idx in range(min(len(raw), 25)):
-        row_values = [str(v).lower() for v in raw.iloc[idx].tolist()]
-        joined = " | ".join(row_values)
-        if "experimento" in joined and (
-            "temperatura" in joined or "velocidad" in joined or "ra " in joined
-        ):
-            header_row = idx
-            break
+    if start_col is not None:
+        raw = raw.iloc[:, max(start_col, 0):]
 
     if header_row is None:
-        # Fallback to default parser if a clear metadata/header split is not detected.
-        df = pd.read_excel(data_path, sheet_name=sheet_name)
-    else:
-        headers = raw.iloc[header_row].tolist()
-        headers = [str(h).strip() if pd.notna(h) else "" for h in headers]
+        header_row = 0
+        for idx in range(min(len(raw), 25)):
+            row = raw.iloc[idx]
+            non_empty = row.dropna()
+            if non_empty.empty:
+                continue
+            string_cells = sum(isinstance(v, str) and bool(v.strip()) for v in non_empty)
+            if string_cells / max(len(row), 1) >= 0.5:
+                header_row = idx
+                break
 
-        # Remove the common leading empty column from the raw worksheet layout.
-        if headers and headers[0] == "":
-            raw = raw.iloc[:, 1:]
-            headers = headers[1:]
+    headers = raw.iloc[header_row].tolist()
+    headers = [str(h).strip() if pd.notna(h) else "" for h in headers]
 
-        df = raw.iloc[header_row + 1 :].copy()
-        df.columns = headers
+    # Remove the common leading empty column from worksheet layouts.
+    if headers and headers[0] == "":
+        raw = raw.iloc[:, 1:]
+        headers = headers[1:]
+
+    df = raw.iloc[header_row + 1 :].copy()
+    df.columns = headers
 
     # Remove unnamed/empty columns and rows that are fully empty.
     df = df.loc[:, [c for c in df.columns if str(c).strip() and "unnamed" not in str(c).lower()]]
