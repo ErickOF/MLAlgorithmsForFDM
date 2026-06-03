@@ -683,8 +683,10 @@ app = Flask(__name__)
 
 _data_cache: tuple[pd.DataFrame, pd.DataFrame] | None = None
 _raw_df_cache: pd.DataFrame | None = None
+_data_source_name = "data/data.xlsx"
 DATA_PATH = Path(__file__).parent / "data/data.xlsx"
 SHEET_NAME = "Datos a utilizar en Minitab"
+_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 
 # Export session store: session_id → cached data
 _export_store: dict[str, dict] = {}
@@ -713,12 +715,77 @@ def _load_raw_df() -> pd.DataFrame:
     return _raw_df_cache.copy()
 
 
+def _reset_loaded_data(df: pd.DataFrame, source_name: str) -> None:
+    """Replace the active dataset and invalidate derived caches."""
+    global _raw_df_cache, _data_cache, _data_source_name
+    df = normalize_dataframe_types(df)
+    df.columns = [str(c).strip() for c in df.columns]
+    if df.empty:
+        raise ValueError("El archivo no contiene filas de datos.")
+    if not any(str(c).strip() for c in df.columns):
+        raise ValueError("No se detectaron nombres de columnas válidos.")
+    _raw_df_cache = df
+    _data_cache = None
+    _data_source_name = source_name
+    _export_store.clear()
+
+
+def _clean_uploaded_excel(
+    file_bytes: bytes,
+    sheet_name: str | int,
+    header_row: int | None,
+    start_col: int | None,
+) -> pd.DataFrame:
+    return read_sheet_clean(
+        io.BytesIO(file_bytes),
+        sheet_name,
+        header_row=header_row,
+        start_col=start_col,
+    )
+
+
+def _clean_uploaded_csv(
+    file_bytes: bytes,
+    sep: str,
+    encoding: str,
+    first_row_header: bool,
+    header_row: int | None,
+    start_col: int | None,
+) -> pd.DataFrame:
+    if sep == "\\t":
+        sep = "\t"
+    header = (0 if header_row is None else header_row) if first_row_header else None
+    df = pd.read_csv(io.BytesIO(file_bytes), sep=sep, encoding=encoding, header=header)
+    if start_col is not None:
+        df = df.iloc[:, max(start_col, 0):]
+    df = df.loc[:, [c for c in df.columns if str(c).strip() and "unnamed" not in str(c).lower()]]
+    return df.dropna(how="all").reset_index(drop=True)
+
+
+def _preview_rows(df: pd.DataFrame, limit: int = 10) -> list[dict[str, str]]:
+    preview = df.head(limit).replace({np.nan: None})
+    rows: list[dict[str, str]] = []
+    for rec in preview.to_dict(orient="records"):
+        rows.append({str(k): ("" if v is None else str(v)) for k, v in rec.items()})
+    return rows
+
+
+def _read_upload_bytes() -> tuple[str, bytes]:
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        raise ValueError("Seleccione un archivo.")
+    file_bytes = upload.read()
+    if not file_bytes:
+        raise ValueError("El archivo está vacío.")
+    if len(file_bytes) > _MAX_UPLOAD_BYTES:
+        raise ValueError("El archivo excede el límite de 25 MB.")
+    return upload.filename, file_bytes
+
+
 def get_data() -> tuple[pd.DataFrame, pd.DataFrame]:
     global _data_cache
     if _data_cache is None:
-        df = read_sheet_clean(DATA_PATH, SHEET_NAME)
-        df = normalize_dataframe_types(df)
-        df.columns = [str(c).strip() for c in df.columns]
+        df = _load_raw_df()
         df, x_df = apply_user_mapping(df)
         _data_cache = (df, x_df)
     df, x_df = _data_cache
@@ -762,6 +829,9 @@ body{font-family:'Segoe UI',Tahoma,sans-serif;background:#f8fafc;color:#1f2937;d
 .sidebar{width:270px;min-width:250px;background:#1e293b;color:#e2e8f0;display:flex;flex-direction:column;overflow-y:auto;padding:14px 12px;gap:10px}
 .app-title{font-size:.95rem;font-weight:700;color:#f1f5f9;line-height:1.3}
 .data-info{font-size:.72rem;color:#94a3b8;padding:5px 8px;background:#0f172a;border-radius:5px}
+.data-source-btn{width:100%;background:#334155;border:none;color:#e2e8f0;padding:6px 9px;border-radius:5px;font-size:.76rem;cursor:pointer;text-align:left;transition:background .15s}
+.data-source-btn:hover:not(:disabled){background:#475569}
+.data-source-btn:disabled{opacity:.45;cursor:not-allowed}
 .section-head{font-size:.7rem;text-transform:uppercase;letter-spacing:.06em;color:#64748b;margin-bottom:4px}
 .algo-card{background:#334155;border-radius:6px;padding:6px 8px;margin-bottom:4px;transition:background .15s}
 .algo-card.enabled{background:#1d4ed8}
@@ -825,6 +895,15 @@ tfoot input{width:100%;box-sizing:border-box;font-size:.7rem;padding:2px 3px;mar
 .ms-opt{display:flex;align-items:center;gap:5px;font-size:.82rem;color:#374151;cursor:pointer}
 .ms-opt input[type=checkbox]{accent-color:#0ea5e9;width:14px;height:14px}
 .f-hint{font-size:.71rem;color:#6b7280;font-style:italic;margin-top:2px}
+.data-modal{max-width:720px;width:96vw;max-height:90vh;display:flex;flex-direction:column;overflow:hidden}
+.data-modal .modal-body{overflow-y:auto}
+.parse-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px}
+.data-warning{font-size:.78rem;color:#92400e;background:#fffbeb;border:1px solid #fbbf24;border-radius:6px;padding:7px 9px}
+.data-success{font-size:.78rem;color:#166534;background:#f0fdf4;border:1px solid #86efac;border-radius:6px;padding:7px 9px}
+.preview-wrap{max-height:260px;overflow:auto;border:1px solid #e5e7eb;border-radius:6px}
+.preview-table{width:100%;border-collapse:collapse;font-size:.76rem}
+.preview-table th{position:sticky;top:0;background:#f1f5f9;color:#374151;font-weight:600;text-align:left;padding:5px 7px;border-bottom:1px solid #e5e7eb}
+.preview-table td{padding:4px 7px;border-bottom:1px solid #f1f5f9;white-space:nowrap}
 /* ---- Progress bar ---- */
 .progress-wrap{padding:6px 14px;background:#fff;border-bottom:1px solid #e5e7eb;flex-shrink:0;position:relative}
 .progress-track{position:relative;height:22px;background:#e5e7eb;border-radius:11px;cursor:default;overflow:visible}
@@ -990,6 +1069,7 @@ th[data-tip]:hover::after{opacity:1}
   <aside class="sidebar">
     <div class="app-title">MEX/FDM Quality Analyzer</div>
     <div class="data-info" id="data-info">Cargando datos…</div>
+    <button class="data-source-btn" id="data-load-btn" onclick="openDataModal()">&#128194; Cargar datos…</button>
 
     <div>
       <div class="section-head">Variables</div>
@@ -1032,6 +1112,81 @@ th[data-tip]:hover::after{opacity:1}
     <div id="spinner"><div class="ring"></div><span>Ejecutando análisis…</span></div>
     <div id="results" style="display:none;flex:1;display:none;flex-direction:column;overflow:hidden"></div>
   </main>
+</div>
+
+<!-- Data source modal -->
+<div class="overlay hidden" id="data-overlay" onclick="dataOverlayClick(event)">
+  <div class="modal data-modal">
+    <div class="modal-hdr">
+      <h3>Cargar datos</h3>
+      <button class="close-x" onclick="closeDataModal()">&#x2715;</button>
+    </div>
+    <div class="modal-body">
+      <div class="f-field">
+        <label>Archivo Excel o CSV</label>
+        <input type="file" id="data-file-input" accept=".xlsx,.xls,.csv" onchange="inspectDataFile()">
+        <div class="f-hint">El archivo cargado reemplaza el conjunto activo para el siguiente análisis.</div>
+      </div>
+
+      <div id="excel-options" class="parse-row" style="display:none">
+        <div class="f-field">
+          <label>Hoja</label>
+          <select id="data-sheet-select"></select>
+        </div>
+        <div class="f-field">
+          <label>Fila de encabezado (opcional)</label>
+          <input type="number" id="excel-header-row" min="1" placeholder="Auto">
+        </div>
+        <div class="f-field">
+          <label>Columna inicial (opcional)</label>
+          <input type="number" id="excel-start-col" min="1" placeholder="1">
+        </div>
+      </div>
+
+      <div id="csv-options" class="parse-row" style="display:none">
+        <div class="f-field">
+          <label>Separador</label>
+          <select id="csv-separator" onchange="toggleCustomSeparator()">
+            <option value=",">Coma (,)</option>
+            <option value=";">Punto y coma (;)</option>
+            <option value="\\t">Tabulador</option>
+            <option value="|">Pipe (|)</option>
+            <option value="custom">Personalizado</option>
+          </select>
+        </div>
+        <div class="f-field" id="custom-separator-field" style="display:none">
+          <label>Separador personalizado</label>
+          <input type="text" id="csv-custom-separator" maxlength="4" placeholder=",">
+        </div>
+        <div class="f-field">
+          <label>Fila de encabezado</label>
+          <input type="number" id="csv-header-row" min="1" value="1">
+        </div>
+        <div class="f-field">
+          <label>Columna inicial</label>
+          <input type="number" id="csv-start-col" min="1" value="1">
+        </div>
+        <label class="exp-check-row" style="align-self:end;padding-bottom:6px">
+          <input type="checkbox" id="csv-first-header" checked> Primera fila es encabezado
+        </label>
+        <div class="f-field">
+          <label>Codificación</label>
+          <select id="csv-encoding">
+            <option value="utf-8">UTF-8</option>
+            <option value="latin-1">Latin-1</option>
+            <option value="cp1252">Windows-1252</option>
+          </select>
+        </div>
+      </div>
+
+      <div id="data-load-message"></div>
+      <div id="data-preview"></div>
+    </div>
+    <div class="modal-ftr">
+      <button class="btn btn-primary" id="data-preview-btn" onclick="loadDataPreview()" disabled>Cargar y previsualizar</button>
+      <button class="btn btn-ghost" onclick="closeDataModal()">Cerrar</button>
+    </div>
+  </div>
 </div>
 
 <!-- Variables modal -->
@@ -1228,6 +1383,7 @@ const OPT_REGISTRY = __OPT_REGISTRY__;
 const OPT_ALGO_LABELS = __OPT_ALGO_LABELS__;
 const algoConfigs = {};
 let curAlgo = null, curType = null;
+let _dataFileKind = null;
 
 // ---------- Metric tooltips ----------
 const COL_TOOLTIPS = {
@@ -1415,6 +1571,144 @@ document.addEventListener('DOMContentLoaded', () => {
   fetchDataInfo();
 });
 
+function _esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+function _escAttr(v) { return _esc(v); }
+
+function openDataModal() {
+  document.getElementById('data-overlay').classList.remove('hidden');
+}
+function closeDataModal() { document.getElementById('data-overlay').classList.add('hidden'); }
+function dataOverlayClick(e) { if (e.target === document.getElementById('data-overlay')) closeDataModal(); }
+
+function _setDataMessage(kind, text) {
+  const el = document.getElementById('data-load-message');
+  el.className = kind === 'warn' ? 'data-warning' : kind === 'ok' ? 'data-success' : 'err';
+  el.textContent = text || '';
+  el.style.display = text ? 'block' : 'none';
+}
+
+function toggleCustomSeparator() {
+  const isCustom = document.getElementById('csv-separator').value === 'custom';
+  document.getElementById('custom-separator-field').style.display = isCustom ? 'flex' : 'none';
+}
+
+async function inspectDataFile() {
+  const input = document.getElementById('data-file-input');
+  const file = input.files && input.files[0];
+  _dataFileKind = null;
+  document.getElementById('excel-options').style.display = 'none';
+  document.getElementById('csv-options').style.display = 'none';
+  document.getElementById('data-preview-btn').disabled = true;
+  document.getElementById('data-preview').innerHTML = '';
+  _setDataMessage('', '');
+  if (!file) return;
+
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const resp = await fetch('/data_file_info', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      _setDataMessage('err', data.error || 'No se pudo inspeccionar el archivo.');
+      return;
+    }
+    _dataFileKind = data.kind;
+    if (data.kind === 'excel') {
+      const sheetSel = document.getElementById('data-sheet-select');
+      sheetSel.innerHTML = (data.sheets || []).map(s => `<option value="${_escAttr(s)}">${_esc(s)}</option>`).join('');
+      document.getElementById('excel-options').style.display = 'grid';
+    } else {
+      document.getElementById('csv-options').style.display = 'grid';
+      toggleCustomSeparator();
+    }
+    document.getElementById('data-preview-btn').disabled = false;
+  } catch (e) {
+    _setDataMessage('err', 'Error de conexión: ' + e.message);
+  }
+}
+
+async function loadDataPreview() {
+  const input = document.getElementById('data-file-input');
+  const file = input.files && input.files[0];
+  if (!file || !_dataFileKind) return;
+  const btn = document.getElementById('data-preview-btn');
+  btn.disabled = true;
+  btn.textContent = 'Cargando...';
+  _setDataMessage('', '');
+  document.getElementById('data-preview').innerHTML = '';
+
+  const fd = new FormData();
+  fd.append('file', file);
+  if (_dataFileKind === 'excel') {
+    fd.append('sheet', document.getElementById('data-sheet-select').value);
+    const header = document.getElementById('excel-header-row').value.trim();
+    if (header) fd.append('header_row', header);
+    const startCol = document.getElementById('excel-start-col').value.trim();
+    if (startCol) fd.append('start_col', startCol);
+  } else {
+    const sepSel = document.getElementById('csv-separator').value;
+    const sep = sepSel === 'custom' ? document.getElementById('csv-custom-separator').value : sepSel;
+    fd.append('separator', sep || ',');
+    fd.append('encoding', document.getElementById('csv-encoding').value);
+    fd.append('first_row_header', document.getElementById('csv-first-header').checked ? 'true' : 'false');
+    const header = document.getElementById('csv-header-row').value.trim();
+    if (header) fd.append('header_row', header);
+    const startCol = document.getElementById('csv-start-col').value.trim();
+    if (startCol) fd.append('start_col', startCol);
+  }
+
+  try {
+    const resp = await fetch('/load_data', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (!resp.ok) {
+      _setDataMessage('err', data.error || 'No se pudo cargar el archivo.');
+      return;
+    }
+    const warning = (data.warnings || []).join(' ');
+    _setDataMessage(warning ? 'warn' : 'ok',
+      (warning ? warning + ' ' : '') +
+      `Datos cargados: ${data.filename} (${data.n_obs} filas, ${data.n_cols} columnas).`
+    );
+    _renderDataPreview(data.preview || [], data.preview_columns || []);
+    await fetchDataInfo();
+    _clearResultsForNewData();
+  } catch (e) {
+    _setDataMessage('err', 'Error de conexión: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Cargar y previsualizar';
+  }
+}
+
+function _renderDataPreview(rows, previewCols) {
+  const el = document.getElementById('data-preview');
+  if (!rows.length) {
+    el.innerHTML = '<div class="f-hint">Sin filas para previsualizar.</div>';
+    return;
+  }
+  const cols = previewCols.length ? previewCols : Object.keys(rows[0]);
+  el.innerHTML =
+    '<div class="preview-wrap"><table class="preview-table"><thead><tr>' +
+    cols.map(c => `<th>${_esc(c)}</th>`).join('') +
+    '</tr></thead><tbody>' +
+    rows.map(r => '<tr>' + cols.map(c => `<td>${_esc(r[c] || '')}</td>`).join('') + '</tr>').join('') +
+    '</tbody></table></div>';
+}
+
+function _clearResultsForNewData() {
+  _sessionId = null; _availableTabs = [];
+  document.getElementById('export-results-btn').disabled = true;
+  document.getElementById('spinner').style.display = 'none';
+  const resultsEl = document.getElementById('results');
+  resultsEl.style.display = 'none';
+  resultsEl.innerHTML = '';
+  document.getElementById('placeholder').style.display = 'flex';
+}
+
 function renderGroup(type, container) {
   for (const [id, algo] of Object.entries(REGISTRY[type])) {
     const card = document.createElement('div');
@@ -1599,6 +1893,7 @@ async function runAnalysis() {
   resultsEl.style.display = 'none';
   resultsEl.innerHTML = '';
   document.getElementById('run-btn').disabled = true;
+  document.getElementById('data-load-btn').disabled = true;
   document.getElementById('export-results-btn').disabled = true;
   _sessionId = null; _availableTabs = [];
   _totalTasks = 0; _doneTasks = 0; _taskStatus = {}; _taskList = [];
@@ -1643,6 +1938,7 @@ async function runAnalysis() {
   } finally {
     document.getElementById('spinner').style.display = 'none';
     document.getElementById('run-btn').disabled = false;
+    document.getElementById('data-load-btn').disabled = false;
   }
 }
 
@@ -2127,7 +2423,8 @@ async function fetchDataInfo() {
   try {
     const r = await fetch('/data_info');
     const d = await r.json();
-    document.getElementById('data-info').textContent = d.n_obs + ' observaciones · ' + d.n_cols + ' variables';
+    const src = d.source_name ? d.source_name + ' · ' : '';
+    document.getElementById('data-info').textContent = src + d.n_obs + ' observaciones · ' + d.n_cols + ' variables';
     _populateColSelectors(d.columns || []);
   } catch {
     document.getElementById('data-info').textContent = 'Datos no disponibles';
@@ -2863,6 +3160,78 @@ def index() -> Response:
     return Response(html, mimetype="text/html")
 
 
+@app.route("/data_file_info", methods=["POST"])
+def data_file_info() -> Response:
+    """Inspect an uploaded file enough to configure parsing options."""
+    try:
+        filename, file_bytes = _read_upload_bytes()
+        suffix = Path(filename).suffix.lower()
+        if suffix in {".xlsx", ".xls"}:
+            xls = pd.ExcelFile(io.BytesIO(file_bytes))
+            return jsonify({"kind": "excel", "filename": filename, "sheets": xls.sheet_names})
+        if suffix == ".csv":
+            return jsonify({"kind": "csv", "filename": filename, "sheets": []})
+        return jsonify({"error": "Formato no soportado. Use .xlsx, .xls o .csv."}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": str(exc)}), 400
+
+
+@app.route("/load_data", methods=["POST"])
+def load_data() -> Response:
+    """Parse an uploaded dataset, make it active, and return a small preview."""
+    try:
+        filename, file_bytes = _read_upload_bytes()
+        suffix = Path(filename).suffix.lower()
+        header_row_raw = (request.form.get("header_row") or "").strip()
+        header_row = None
+        if header_row_raw:
+            header_row = max(int(header_row_raw) - 1, 0)
+        start_col_raw = (request.form.get("start_col") or "").strip()
+        start_col = None
+        if start_col_raw:
+            start_col = max(int(start_col_raw) - 1, 0)
+        warnings_out: list[str] = []
+
+        if suffix in {".xlsx", ".xls"}:
+            sheet = request.form.get("sheet") or 0
+            df = _clean_uploaded_excel(file_bytes, sheet, header_row, start_col)
+        elif suffix == ".csv":
+            sep = request.form.get("separator") or ","
+            encoding = request.form.get("encoding") or "utf-8"
+            first_header = request.form.get("first_row_header", "true") == "true"
+            df = _clean_uploaded_csv(file_bytes, sep, encoding, first_header, header_row, start_col)
+            if len(df.columns) <= 1:
+                warnings_out.append("Solo se detectó una columna; revise el separador del CSV.")
+        else:
+            return jsonify({"error": "Formato no soportado. Use .xlsx, .xls o .csv."}), 400
+
+        df = normalize_dataframe_types(df)
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.loc[:, [c for c in df.columns if str(c).strip()]]
+        df = df.dropna(how="all").reset_index(drop=True)
+        if df.empty:
+            return jsonify({"error": "El archivo no contiene filas después de parsearlo."}), 400
+
+        _reset_loaded_data(df, filename)
+        numeric_cols = df.select_dtypes(include=["number"]).columns.tolist()
+        return jsonify({
+            "filename": filename,
+            "n_obs": len(df),
+            "n_cols": len(df.columns),
+            "numeric_cols": len(numeric_cols),
+            "columns": list(map(str, df.columns)),
+            "preview_columns": list(map(str, df.columns)),
+            "preview": _preview_rows(df),
+            "warnings": warnings_out,
+        })
+    except UnicodeDecodeError:
+        return jsonify({"error": "No se pudo leer el CSV con la codificación seleccionada."}), 400
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"No se pudo cargar el archivo: {exc}"}), 400
+
+
 @app.route("/data_info")
 def data_info() -> Response:
     try:
@@ -2873,7 +3242,12 @@ def data_info() -> Response:
             for c in raw.columns
             if str(c).strip()
         ]
-        return jsonify({"n_obs": len(raw), "n_cols": len(raw.columns), "columns": all_cols})
+        return jsonify({
+            "n_obs": len(raw),
+            "n_cols": len(raw.columns),
+            "columns": all_cols,
+            "source_name": _data_source_name,
+        })
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
 
