@@ -689,6 +689,7 @@ SHEET_NAME = "Datos a utilizar en Minitab"
 # Export session store: session_id → cached data
 _export_store: dict[str, dict] = {}
 _EXPORT_STORE_MAX = 8   # keep at most N sessions in RAM
+_RESTORE_ZIP_MAX_BYTES = 50 * 1024 * 1024
 
 # Column order for metric CSVs (mirrors JS REG_COLS / CLS_COLS)
 _REG_METRIC_COLS = [
@@ -923,6 +924,11 @@ th[data-tip]:hover::after{opacity:1}
 .export-btn{flex:1;padding:6px 4px;background:#1e3a5f;border:1px solid #334155;color:#93c5fd;border-radius:5px;font-size:.74rem;cursor:pointer;text-align:center;transition:background .13s}
 .export-btn:hover:not(:disabled){background:#1d4ed8;color:#fff;border-color:#3b82f6}
 .export-btn:disabled{opacity:.38;cursor:not-allowed}
+.restore-banner{display:none;margin:10px 14px 0;padding:8px 10px;border-radius:6px;font-size:.8rem;border-left:3px solid #0ea5e9;background:#f0f9ff;color:#075985}
+.restore-banner.warn{border-left-color:#f59e0b;background:#fffbeb;color:#92400e}
+.restore-banner.err{border-left-color:#dc2626;background:#fef2f2;color:#991b1b}
+.toast{position:fixed;right:18px;bottom:18px;z-index:1200;padding:9px 12px;border-radius:6px;background:#0f172a;color:#f8fafc;font-size:.82rem;box-shadow:0 10px 30px rgba(15,23,42,.25);opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .18s,transform .18s}
+.toast.show{opacity:1;transform:translateY(0)}
 /* ---- Export results modal ---- */
 .export-modal{max-width:500px;width:96vw}
 .export-modal .modal-body{padding:12px 16px;gap:7px}
@@ -1020,12 +1026,19 @@ th[data-tip]:hover::after{opacity:1}
     <button class="run-btn" id="run-btn" onclick="runAnalysis()">&#9654; Ejecutar Análisis</button>
     <div class="export-row">
       <button class="export-btn" onclick="exportConfig()" title="Descargar configuración como JSON">&#11123; Config</button>
-      <button class="export-btn" id="export-results-btn" disabled onclick="openExportModal()" title="Exportar resultados como ZIP">&#11123; Resultados</button>
+      <button class="export-btn restore-control" id="load-config-btn" onclick="openLoadConfig()" title="Cargar configuración desde JSON">&#11121; Load Config</button>
     </div>
+    <div class="export-row">
+      <button class="export-btn" id="export-results-btn" disabled onclick="openExportModal()" title="Exportar resultados como ZIP">&#11123; Resultados</button>
+      <button class="export-btn restore-control" id="load-results-btn" onclick="openLoadResults()" title="Cargar resultados desde ZIP">&#11121; Load Results</button>
+    </div>
+    <input type="file" id="load-config-input" accept=".json,application/json" style="display:none" onchange="loadConfigFile(event)">
+    <input type="file" id="load-results-input" accept=".zip,application/zip" style="display:none" onchange="loadResultsFile(event)">
   </aside>
 
   <!-- Content -->
   <main class="content">
+    <div id="restore-banner" class="restore-banner"></div>
     <div id="placeholder">
       Seleccione uno o más algoritmos y haga clic en <br><strong>Ejecutar Análisis</strong> para comenzar.
     </div>
@@ -1033,6 +1046,7 @@ th[data-tip]:hover::after{opacity:1}
     <div id="results" style="display:none;flex:1;display:none;flex-direction:column;overflow:hidden"></div>
   </main>
 </div>
+<div id="toast" class="toast"></div>
 
 <!-- Variables modal -->
 <div class="overlay hidden" id="var-overlay" onclick="varOverlayClick(event)">
@@ -1228,6 +1242,43 @@ const OPT_REGISTRY = __OPT_REGISTRY__;
 const OPT_ALGO_LABELS = __OPT_ALGO_LABELS__;
 const algoConfigs = {};
 let curAlgo = null, curType = null;
+
+function _esc(v) {
+  return String(v ?? '').replace(/[&<>"']/g, ch => ({
+    '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;'
+  }[ch]));
+}
+
+function _jsSlugify(text) {
+  return String(text || '').trim().toLowerCase().replace(/[^0-9a-zA-Z]+/g, '_').replace(/^_+|_+$/g, '') || 'plot';
+}
+
+function _chartForObj(charts, tabId, obj) {
+  const direct = tabId + '__' + _jsSlugify(obj);
+  if (charts && charts[direct]) return charts[direct];
+  const prefix = tabId + '__';
+  const wanted = _jsSlugify(obj);
+  for (const [key, html] of Object.entries(charts || {})) {
+    if (key.startsWith(prefix) && _jsSlugify(key.slice(prefix.length)) === wanted) return html;
+  }
+  return '';
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  if (!t) return;
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+function showRestoreBanner(msg, kind) {
+  const b = document.getElementById('restore-banner');
+  if (!b) return;
+  b.className = 'restore-banner' + (kind ? ' ' + kind : '');
+  b.textContent = msg || '';
+  b.style.display = msg ? 'block' : 'none';
+}
 
 // ---------- Metric tooltips ----------
 const COL_TOOLTIPS = {
@@ -1572,6 +1623,14 @@ let _sessionId = null, _availableTabs = [];
 const REG_COLS = ['objective','rank','cv_mae','cv_rmse','train_rmse','overfit_gap','cv_r2','cv_rmse_std','holdout_mae','holdout_rmse','holdout_r2'];
 const CLS_COLS = ['objective','rank','cv_accuracy','cv_f1_macro','cv_balanced_accuracy','train_balanced_accuracy','overfit_gap','holdout_accuracy','holdout_f1_macro','holdout_balanced_accuracy'];
 
+function _resetSessionUiState() {
+  _sessionId = null; _availableTabs = [];
+  _totalTasks = 0; _doneTasks = 0; _taskStatus = {}; _taskList = [];
+  Object.keys(_sweepComboParams || {}).forEach(k => delete _sweepComboParams[k]);
+  Object.keys(_boundsCache || {}).forEach(k => delete _boundsCache[k]);
+  if (Array.isArray(_availableObjSpecs)) _availableObjSpecs.length = 0;
+}
+
 // ---------- Run ----------
 async function runAnalysis() {
   const reg = {}, cls = {};
@@ -1600,8 +1659,9 @@ async function runAnalysis() {
   resultsEl.innerHTML = '';
   document.getElementById('run-btn').disabled = true;
   document.getElementById('export-results-btn').disabled = true;
-  _sessionId = null; _availableTabs = [];
-  _totalTasks = 0; _doneTasks = 0; _taskStatus = {}; _taskList = [];
+  _setRestoreControlsDisabled(true);
+  showRestoreBanner('', '');
+  _resetSessionUiState();
 
   try {
     const resp = await fetch('/run', {
@@ -1643,6 +1703,7 @@ async function runAnalysis() {
   } finally {
     document.getElementById('spinner').style.display = 'none';
     document.getElementById('run-btn').disabled = false;
+    _setRestoreControlsDisabled(false);
   }
 }
 
@@ -1758,6 +1819,46 @@ function _modelPanel(tabId, taskType, hasSweep) {
   return html;
 }  // tabId → last objective string
 
+function _appendMetricRow(tabId, taskType, modelName, objective, metrics, chartHtml) {
+  const cols = taskType === 'regression' ? REG_COLS : CLS_COLS;
+  const tbody = document.getElementById('tbody-' + tabId);
+  if (tbody) {
+    const tr = document.createElement('tr');
+    const isWinner = metrics && metrics.rank === 1;
+    if (isWinner) tr.className = 'winner-row';
+    cols.forEach(col => {
+      const td = document.createElement('td');
+      if (col === 'objective') {
+        td.textContent = objective;
+      } else if (col === 'rank' && isWinner) {
+        td.textContent = '🏆 1';
+      } else {
+        const v = metrics ? metrics[col] : undefined;
+        td.textContent = v != null ? (typeof v === 'number' ? v.toFixed(4) : v) : '—';
+      }
+      tr.appendChild(td);
+    });
+    const optTd = document.createElement('td');
+    optTd.className = 'opt-col';
+    const safeObj = objective.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+    optTd.innerHTML = '<button class="row-opt-btn" onclick="openOptModal(\'' +
+      tabId + '\', \'' + modelName + '\', \'' + safeObj + '\')" title="Optimizar con este objetivo">&#9889;</button>';
+    tr.appendChild(optTd);
+    tbody.appendChild(tr);
+  }
+
+  const chartsEl = document.getElementById('charts-' + tabId);
+  if (chartsEl && chartHtml) {
+    const det = document.createElement('details');
+    det.className = 'obj-group';
+    det.innerHTML = '<summary>' + _esc(objective) + '</summary>' +
+      '<div class="obj-body"><div class="chart-wrap">' + chartHtml + '</div></div>';
+    chartsEl.appendChild(det);
+    execScripts(det);
+  }
+  _registerObjSpec(tabId, modelName, objective);
+}
+
 function _handleResult(data) {
   // algo_sweep_charts is emitted automatically (not a counted task)
   if (data.task !== 'algo_sweep_charts') {
@@ -1774,48 +1875,7 @@ function _handleResult(data) {
   if (prefix) {
     for (const [modelName, mData] of Object.entries(data.models || {})) {
       const tabId = prefix + '-' + modelName;
-
-      // Append metrics row
-      const tbody = document.getElementById('tbody-' + tabId);
-      if (tbody) {
-        const tr = document.createElement('tr');
-        const isWinner = mData.metrics && mData.metrics.rank === 1;
-        if (isWinner) tr.className = 'winner-row';
-        cols.forEach(col => {
-          const td = document.createElement('td');
-          if (col === 'objective') {
-            td.textContent = data.obj;
-          } else if (col === 'rank' && isWinner) {
-            td.textContent = '🏆 1';
-          } else {
-            const v = mData.metrics ? mData.metrics[col] : undefined;
-            td.textContent = v != null ? (typeof v === 'number' ? v.toFixed(4) : v) : '—';
-          }
-          tr.appendChild(td);
-        });
-        // Per-row optimize button
-        const optTd = document.createElement('td');
-        optTd.className = 'opt-col';
-        const safeObj = data.obj.replace(/\\/g, '\\\\').replace(/'/g, "\\'");
-        optTd.innerHTML = '<button class="row-opt-btn" onclick="openOptModal(\'' +
-          tabId + '\', \'' + modelName + '\', \'' + safeObj + '\')" title="Optimizar con este objetivo">&#9889;</button>';
-        tr.appendChild(optTd);
-        tbody.appendChild(tr);
-      }
-
-      // Append collapsible chart group
-      const chartsEl = document.getElementById('charts-' + tabId);
-      if (chartsEl && mData.chart_html) {
-        const det = document.createElement('details');
-        det.className = 'obj-group';
-        det.innerHTML = '<summary>' + data.obj + '</summary>' +
-          '<div class="obj-body"><div class="chart-wrap">' + mData.chart_html + '</div></div>';
-        chartsEl.appendChild(det);
-        execScripts(det);
-      }
-
-      // Register for multi-objective panel
-      _registerObjSpec(tabId, modelName, data.obj);
+      _appendMetricRow(tabId, data.task, modelName, data.obj, mData.metrics || {}, mData.chart_html || '');
     }
   } else if (data.task === 'sweep_combo') {
     // Update the pre-populated pending row for this combo
@@ -1862,6 +1922,140 @@ function _handleDone() {
   initDataTables();
   const eb = document.getElementById('export-results-btn');
   if (eb) eb.disabled = false;
+}
+
+function _setRestoreControlsDisabled(disabled) {
+  document.querySelectorAll('.restore-control').forEach(btn => {
+    if (!btn.dataset.readyTitle) btn.dataset.readyTitle = btn.title;
+    btn.disabled = disabled;
+    btn.title = disabled ? 'No disponible mientras se ejecuta un análisis.' : btn.dataset.readyTitle || btn.title;
+  });
+}
+
+function _modelsFromRestored(data) {
+  const reg = new Set(), cls = new Set(), sweepReg = new Set(), sweepCls = new Set();
+  (data.reg_models || []).forEach(m => reg.add(m));
+  (data.cls_models || []).forEach(m => cls.add(m));
+  (data.sweep_reg_models || []).forEach(m => { reg.add(m); sweepReg.add(m); });
+  (data.sweep_cls_models || []).forEach(m => { cls.add(m); sweepCls.add(m); });
+  for (const [tabId, tdata] of Object.entries(data.metric_tables || {})) {
+    if (tdata.type === 'regression' || tabId.startsWith('reg-')) reg.add(tabId.replace(/^reg-/, ''));
+    if (tdata.type === 'classification' || tabId.startsWith('cls-')) cls.add(tabId.replace(/^cls-/, ''));
+  }
+  for (const sdata of Object.values(data.sweep_tables || {})) {
+    const tabId = sdata.tab_id || '';
+    if (tabId.startsWith('reg-')) { const m = tabId.replace(/^reg-/, ''); reg.add(m); sweepReg.add(m); }
+    if (tabId.startsWith('cls-')) { const m = tabId.replace(/^cls-/, ''); cls.add(m); sweepCls.add(m); }
+  }
+  return {
+    reg_models: [...reg],
+    cls_models: [...cls],
+    sweep_reg_models: [...sweepReg],
+    sweep_cls_models: [...sweepCls],
+  };
+}
+
+function _modelLabels() {
+  const labels = {};
+  for (const [id, spec] of Object.entries(REGISTRY.regression || {})) labels[id] = spec.label || id;
+  for (const [id, spec] of Object.entries(REGISTRY.classification || {})) labels[id] = spec.label || id;
+  return labels;
+}
+
+function _restoreSweepTables(sweepTables, sweepCharts) {
+  const comboList = [];
+  const rowSpecs = [];
+  for (const [key, sdata] of Object.entries(sweepTables || {})) {
+    const rows = sdata.rows || [];
+    const paramNames = sdata.param_names || [];
+    const metricCols = sdata.task_type === 'classification'
+      ? ['cv_accuracy','cv_f1_macro','cv_balanced_accuracy','holdout_accuracy','holdout_f1_macro','holdout_balanced_accuracy']
+      : ['cv_mae','cv_rmse','cv_r2','cv_rmse_std','holdout_mae','holdout_rmse','holdout_r2'];
+    const inferredParams = paramNames.length
+      ? paramNames
+      : Object.keys(rows[0] || {}).filter(k => !metricCols.includes(k) && k !== 'objective' && k !== 'rank');
+    const safeKey = key.replace(/[^a-zA-Z0-9_-]/g, '_');
+    rows.forEach((row, idx) => {
+      const comboId = 'restore__' + safeKey + '__' + idx;
+      const params = {};
+      inferredParams.forEach(p => { params[p] = row[p]; });
+      comboList.push({
+        combo_id: comboId,
+        tab_id: sdata.tab_id,
+        obj: sdata.obj || key.split('__').slice(1).join('__'),
+        safe_key: safeKey,
+        task_type: sdata.task_type || 'regression',
+        params,
+      });
+      rowSpecs.push({ comboId, row });
+    });
+  }
+  _initSweepTables(comboList);
+  rowSpecs.forEach(spec => {
+    const rowEl = document.querySelector('[data-combo-id="' + spec.comboId + '"]');
+    if (!rowEl) return;
+    rowEl.querySelectorAll('td[data-metric]').forEach(cell => {
+      const metric = cell.dataset.metric;
+      const v = spec.row ? spec.row[metric] : undefined;
+      cell.className = 'sweep-cell-done';
+      cell.innerHTML = (v == null) ? '&mdash;' : (typeof v === 'number' ? v.toFixed(4) : v);
+    });
+  });
+  for (const [key, html] of Object.entries(sweepCharts || {})) {
+    const safeKey = key.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const container = document.querySelector('[data-sweep-charts="' + safeKey + '"]');
+    if (container && html) { container.innerHTML = html; execScripts(container); }
+  }
+}
+
+function renderRestoredSession(data, filename) {
+  const resultsEl = document.getElementById('results');
+  const models = _modelsFromRestored(data);
+  const taskCount = Object.values(data.metric_tables || {}).reduce((n, t) => n + ((t.rows || []).length), 0) +
+    Object.values(data.sweep_tables || {}).reduce((n, t) => n + ((t.rows || []).length), 0);
+  const skeletonData = {
+    ...models,
+    total: taskCount,
+    task_list: [],
+    model_labels: Object.assign(_modelLabels(), data.model_labels || {}),
+  };
+
+  _resetSessionUiState();
+  if (data.bounds_by_tab) Object.assign(_boundsCache, data.bounds_by_tab);
+  _sessionId = data.session_id || null;
+  _totalTasks = taskCount;
+  _doneTasks = taskCount;
+  const labels = skeletonData.model_labels || {};
+  models.reg_models.forEach(m => _availableTabs.push({tab_id: 'reg-' + m, label: (labels[m] || m) + ' (regresión)'}));
+  models.cls_models.forEach(m => _availableTabs.push({tab_id: 'cls-' + m, label: (labels[m] || m) + ' (clasificación)'}));
+
+  document.getElementById('placeholder').style.display = 'none';
+  document.getElementById('spinner').style.display = 'none';
+  resultsEl.style.display = 'flex';
+  resultsEl.style.flexDirection = 'column';
+  resultsEl.style.overflow = 'hidden';
+  resultsEl.innerHTML = _buildSkeleton(skeletonData);
+
+  const edaPanel = document.getElementById('panel-eda');
+  if (edaPanel && data.eda_html) { edaPanel.innerHTML = data.eda_html; execScripts(edaPanel); }
+
+  for (const [tabId, tdata] of Object.entries(data.metric_tables || {})) {
+    const modelName = tabId.replace(/^(reg|cls)-/, '');
+    for (const row of (tdata.rows || [])) {
+      const obj = row.objective || '';
+      _appendMetricRow(tabId, tdata.type || (tabId.startsWith('cls-') ? 'classification' : 'regression'),
+        modelName, obj, row, _chartForObj(data.charts || {}, tabId, obj));
+    }
+  }
+  _restoreSweepTables(data.sweep_tables || {}, data.sweep_charts || {});
+
+  const firstBtn = resultsEl.querySelector('.tab-btn');
+  if (firstBtn) showTab(firstBtn.dataset.tab);
+  _updateProgress();
+  initDataTables();
+  document.getElementById('export-results-btn').disabled = !_sessionId;
+  const exportedAt = data.exported_at ? ' — exported on ' + data.exported_at : '';
+  showRestoreBanner('Results restored from ' + filename + exportedAt + '.', '');
 }
 
 // ---------- Sweep table pre-population ----------
@@ -2046,6 +2240,152 @@ function initDataTables() {
 }
 
 // ---------- Export ----------
+function openLoadConfig() {
+  const input = document.getElementById('load-config-input');
+  input.value = '';
+  input.click();
+}
+
+function openLoadResults() {
+  const input = document.getElementById('load-results-input');
+  input.value = '';
+  input.click();
+}
+
+async function loadConfigFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  try {
+    const config = JSON.parse(await file.text());
+    const result = restoreConfig(config);
+    const msg = 'Config restored from ' + file.name;
+    showToast(msg);
+    showRestoreBanner(
+      result.skipped.length
+        ? msg + '. Columnas omitidas: ' + result.skipped.join(', ')
+        : msg,
+      result.skipped.length ? 'warn' : ''
+    );
+  } catch (err) {
+    showRestoreBanner('Invalid config file: ' + err.message, 'err');
+  }
+}
+
+async function loadResultsFile(e) {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const btn = document.getElementById('load-results-btn');
+  btn.disabled = true;
+  btn.textContent = 'Cargando...';
+  showRestoreBanner('', '');
+  try {
+    const fd = new FormData();
+    fd.append('file', file);
+    const resp = await fetch('/restore', { method: 'POST', body: fd });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      showRestoreBanner(data.error || 'No se pudieron restaurar los resultados.', 'err');
+      return;
+    }
+    if (data.config) {
+      const cfgResult = restoreConfig(data.config);
+      data._configSkipped = cfgResult.skipped || [];
+    }
+    renderRestoredSession(data, file.name);
+    if ((data._configSkipped || []).length) {
+      showRestoreBanner('Results restored from ' + file.name + '. Columnas de config omitidas: ' + data._configSkipped.join(', '), 'warn');
+    }
+    showToast('Results restored from ' + file.name);
+  } catch (err) {
+    showRestoreBanner('Error al restaurar resultados: ' + err.message, 'err');
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Load Results';
+  }
+}
+
+function restoreConfig(config) {
+  if (config && !config.variables && (config.input_cols || config.output_cols || config.regression || config.classification)) {
+    config = {
+      exported_at: config.exported_at || '',
+      variables: {
+        input: config.input_cols || [],
+        output: config.output_cols || [],
+      },
+      algorithms: {
+        regression: config.regression || {},
+        classification: config.classification || {},
+      },
+      options: { class_q: config.class_q || 3 },
+    };
+  }
+  const missing = [];
+  if (!config || typeof config !== 'object') missing.push('root');
+  if (!config.variables) missing.push('variables');
+  else {
+    if (!Array.isArray(config.variables.input)) missing.push('variables.input');
+    if (!Array.isArray(config.variables.output)) missing.push('variables.output');
+  }
+  if (!config.algorithms) missing.push('algorithms');
+  else {
+    if (!config.algorithms.regression) missing.push('algorithms.regression');
+    if (!config.algorithms.classification) missing.push('algorithms.classification');
+  }
+  if (!config.options) missing.push('options');
+  else if (config.options.class_q === undefined) missing.push('options.class_q');
+  if (missing.length) throw new Error('missing fields: ' + missing.join(', '));
+
+  const inputs = new Set(config.variables.input || []);
+  const outputs = new Set(config.variables.output || []);
+  const skipped = [];
+  const seen = new Set();
+
+  document.querySelectorAll('#col-role-body tr').forEach(tr => {
+    const radios = [...tr.querySelectorAll('input[type="radio"][data-col]')];
+    if (!radios.length) return;
+    const col = radios[0].dataset.col;
+    seen.add(col);
+    let role = 'none';
+    if (inputs.has(col)) role = 'input';
+    else if (outputs.has(col)) role = 'output';
+    const radio = radios.find(r => r.value === role);
+    if (radio) {
+      radio.checked = true;
+      tr.className = 'role-' + role;
+    }
+  });
+  [...inputs, ...outputs].forEach(col => { if (!seen.has(col)) skipped.push(col); });
+  _rebuildCombos();
+
+  document.querySelectorAll('[data-type="regression"],[data-type="classification"]').forEach(chk => {
+    chk.checked = false;
+    chk.closest('.algo-card')?.classList.remove('enabled');
+    const cfgBtn = document.getElementById('cfgbtn-' + chk.dataset.algo);
+    if (cfgBtn) cfgBtn.disabled = true;
+  });
+  Object.keys(algoConfigs).forEach(k => delete algoConfigs[k]);
+
+  for (const type of ['regression', 'classification']) {
+    for (const [algoId, params] of Object.entries((config.algorithms && config.algorithms[type]) || {})) {
+      const chk = document.querySelector(`[data-type="${type}"][data-algo="${algoId}"]`);
+      if (!chk) continue;
+      chk.checked = true;
+      chk.closest('.algo-card')?.classList.add('enabled');
+      const cfgBtn = document.getElementById('cfgbtn-' + algoId);
+      if (cfgBtn) cfgBtn.disabled = false;
+      if (params) algoConfigs[algoId] = params;
+      updateSummary(algoId);
+    }
+  }
+  document.querySelectorAll('[data-type="regression"],[data-type="classification"]').forEach(chk => {
+    if (!chk.checked) updateSummary(chk.dataset.algo);
+  });
+
+  const q = config.options ? parseInt(config.options.class_q, 10) : NaN;
+  if (!Number.isNaN(q)) document.getElementById('class-q').value = q;
+  return { skipped };
+}
+
 function exportConfig() {
   const reg = {}, cls = {};
   document.querySelectorAll('[data-type="regression"]:checked').forEach(c => {
@@ -2681,6 +3021,10 @@ def _wrap_chart_html(fragment: str, title: str = "Gráfica") -> str:
 
 def _json_safe(obj: Any) -> Any:
     """Recursively replace NaN/inf/numpy scalars to make obj JSON-serialisable."""
+    if isinstance(obj, pd.DataFrame):
+        return _json_safe(obj.to_dict(orient="records"))
+    if isinstance(obj, pd.Series):
+        return _json_safe(obj.tolist())
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -2693,6 +3037,96 @@ def _json_safe(obj: Any) -> Any:
     if isinstance(obj, float):
         return None if (math.isnan(obj) or math.isinf(obj)) else obj
     return obj
+
+
+def _session_export_payload(store: dict, exported_at: str) -> dict:
+    """Return the JSON-restorable part of an analysis session."""
+    metric_tables = store.get("metric_tables") or {}
+    sweep_tables = store.get("sweep_tables") or {}
+    reg_models = sorted({
+        tab_id.replace("reg-", "", 1)
+        for tab_id, tdata in metric_tables.items()
+        if tab_id.startswith("reg-") or tdata.get("type") == "regression"
+    } | {
+        (sdata.get("tab_id") or "").replace("reg-", "", 1)
+        for sdata in sweep_tables.values()
+        if (sdata.get("tab_id") or "").startswith("reg-")
+    })
+    cls_models = sorted({
+        tab_id.replace("cls-", "", 1)
+        for tab_id, tdata in metric_tables.items()
+        if tab_id.startswith("cls-") or tdata.get("type") == "classification"
+    } | {
+        (sdata.get("tab_id") or "").replace("cls-", "", 1)
+        for sdata in sweep_tables.values()
+        if (sdata.get("tab_id") or "").startswith("cls-")
+    })
+    sweep_reg_models = sorted({
+        (sdata.get("tab_id") or "").replace("reg-", "", 1)
+        for sdata in sweep_tables.values()
+        if (sdata.get("tab_id") or "").startswith("reg-")
+    })
+    sweep_cls_models = sorted({
+        (sdata.get("tab_id") or "").replace("cls-", "", 1)
+        for sdata in sweep_tables.values()
+        if (sdata.get("tab_id") or "").startswith("cls-")
+    })
+    return _json_safe({
+        "format_version": 1,
+        "exported_at": exported_at,
+        "config": _normalise_config_for_restore(store.get("config") or {}, exported_at),
+        "eda_html": store.get("eda_html") or "",
+        "metric_tables": metric_tables,
+        "charts": store.get("charts") or {},
+        "sweep_tables": sweep_tables,
+        "sweep_charts": store.get("sweep_charts") or {},
+        "reg_models": reg_models,
+        "cls_models": cls_models,
+        "sweep_reg_models": sweep_reg_models,
+        "sweep_cls_models": sweep_cls_models,
+        "model_labels": {k: v["label"] for group in ALGO_REGISTRY.values() for k, v in group.items()},
+        "bounds_by_tab": store.get("bounds_by_tab") or {},
+    })
+
+
+def _normalise_config_for_restore(config: dict, exported_at: str | None = None) -> dict:
+    """Convert the server run payload to the public analysis_config.json shape."""
+    if config.get("variables") and config.get("algorithms") and config.get("options"):
+        out = dict(config)
+        if exported_at and not out.get("exported_at"):
+            out["exported_at"] = exported_at
+        return out
+    return {
+        "exported_at": config.get("exported_at") or exported_at,
+        "variables": {
+            "input": config.get("input_cols") or [],
+            "output": config.get("output_cols") or [],
+        },
+        "algorithms": {
+            "regression": config.get("regression") or {},
+            "classification": config.get("classification") or {},
+        },
+        "options": {
+            "class_q": config.get("class_q", 3),
+        },
+    }
+
+
+def _store_restored_session(payload: dict) -> str:
+    session_id = str(uuid.uuid4())
+    while len(_export_store) >= _EXPORT_STORE_MAX:
+        _export_store.pop(next(iter(_export_store)), None)
+    _export_store[session_id] = {
+        "config": _normalise_config_for_restore(payload.get("config") or {}, payload.get("exported_at")),
+        "eda_html": payload.get("eda_html") or "",
+        "metric_tables": payload.get("metric_tables") or {},
+        "charts": payload.get("charts") or {},
+        "sweep_tables": payload.get("sweep_tables") or {},
+        "sweep_charts": payload.get("sweep_charts") or {},
+        "bounds_by_tab": payload.get("bounds_by_tab") or {},
+        "x_df_store": {},
+    }
+    return session_id
 
 
 def _strip_private(d: dict) -> dict:
@@ -2892,14 +3326,19 @@ def export_results() -> Response:
         return jsonify({"error": "Sesión no encontrada o expirada. Ejecute el análisis de nuevo."}), 404
 
     ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M%S")
+    exported_at = pd.Timestamp.now().isoformat()
     prefix = f"analysis_{ts}"
     buf = io.BytesIO()
 
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(
+            f"{prefix}/session.json",
+            json.dumps(_session_export_payload(store, exported_at), indent=2, ensure_ascii=False),
+        )
 
         # --- config.json ---
         if include_config:
-            cfg_data = store.get("config") or {}
+            cfg_data = _normalise_config_for_restore(store.get("config") or {}, exported_at)
             zf.writestr(
                 f"{prefix}/config.json",
                 json.dumps(cfg_data, indent=2, ensure_ascii=False),
@@ -2978,6 +3417,64 @@ def export_results() -> Response:
             "Content-Type": "application/zip",
         },
     )
+
+
+@app.route("/restore", methods=["POST"])
+def restore_results() -> Response:
+    upload = request.files.get("file")
+    if not upload or not upload.filename:
+        return jsonify({"error": "Seleccione un archivo ZIP para restaurar."}), 400
+    if not upload.filename.lower().endswith(".zip"):
+        return jsonify({"error": "El archivo de resultados debe ser un ZIP exportado por la app."}), 400
+
+    try:
+        raw = upload.read()
+        if not raw:
+            return jsonify({"error": "El archivo ZIP está vacío."}), 400
+        if len(raw) > _RESTORE_ZIP_MAX_BYTES:
+            return jsonify({"error": "El ZIP excede el límite de 50 MB."}), 400
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            session_names = [n for n in zf.namelist() if n.endswith("session.json")]
+            if not session_names:
+                return jsonify({
+                    "error": "This ZIP was exported before restore support was added. Re-run the analysis to generate a restorable export."
+                }), 400
+            with zf.open(session_names[0]) as fh:
+                payload = json.loads(fh.read().decode("utf-8"))
+    except zipfile.BadZipFile as exc:
+        return jsonify({"error": f"ZIP corrupto o inválido: {exc}"}), 400
+    except json.JSONDecodeError as exc:
+        return jsonify({"error": f"session.json no es JSON válido: {exc}"}), 400
+    except Exception as exc:  # noqa: BLE001
+        return jsonify({"error": f"No se pudo restaurar el ZIP: {exc}"}), 400
+
+    version = payload.get("format_version")
+    if version != 1:
+        return jsonify({"error": f"Versión de session.json no soportada: {version}"}), 400
+    required = ["config", "eda_html", "metric_tables", "charts", "sweep_tables", "sweep_charts"]
+    missing = [k for k in required if k not in payload]
+    if missing:
+        return jsonify({"error": "session.json inválido; faltan campos: " + ", ".join(missing)}), 400
+
+    session_id = _store_restored_session(payload)
+    config_payload = _normalise_config_for_restore(payload.get("config") or {}, payload.get("exported_at"))
+    return jsonify({
+        "session_id": session_id,
+        "config": config_payload,
+        "eda_html": payload.get("eda_html") or "",
+        "metric_tables": payload.get("metric_tables") or {},
+        "charts": payload.get("charts") or {},
+        "sweep_tables": payload.get("sweep_tables") or {},
+        "sweep_charts": payload.get("sweep_charts") or {},
+        "reg_models": payload.get("reg_models") or [],
+        "cls_models": payload.get("cls_models") or [],
+        "sweep_reg_models": payload.get("sweep_reg_models") or [],
+        "sweep_cls_models": payload.get("sweep_cls_models") or [],
+        "model_labels": payload.get("model_labels") or {},
+        "bounds_by_tab": payload.get("bounds_by_tab") or {},
+        "exported_at": payload.get("exported_at"),
+        "restored": True,
+    })
 
 
 @app.route("/run", methods=["POST"])
@@ -3384,6 +3881,7 @@ def run() -> Response:  # noqa: C901
         }
         yield f"event: init\ndata: {json.dumps(init_payload)}\n\n"
         store["eda_html"] = eda_html
+        store["bounds_by_tab"] = bounds_by_tab
 
         def _run(t: dict) -> dict:
             if t["kind"] == "reg":
